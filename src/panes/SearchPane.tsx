@@ -21,6 +21,10 @@ export default defineComponent({
     const searchByComicIdInput = ref<string>('')
     const currentPage = ref<number>(1)
     const comicCardContainer = ref<HTMLElement>()
+    const downloadingAllSearchResults = ref<boolean>(false)
+    const lastSearchMode = ref<'keyword' | 'tag'>('keyword')
+    const lastSearchKeyword = ref<string>('')
+    const lastSearchTag = ref<string>('')
 
     watch(
       () => store.searchResult,
@@ -45,6 +49,8 @@ export default defineComponent({
       }
 
       searchingByKeyword.value = false
+      lastSearchMode.value = 'keyword'
+      lastSearchKeyword.value = keyword
       store.searchResult = result.data
     }
 
@@ -62,6 +68,8 @@ export default defineComponent({
       }
 
       searchingByTag.value = false
+      lastSearchMode.value = 'tag'
+      lastSearchTag.value = tagName
       store.searchResult = result.data
       store.currentTabName = 'search'
     }
@@ -93,6 +101,130 @@ export default defineComponent({
 
       store.pickedComic = result.data
       store.currentTabName = 'comic'
+    }
+
+    function sleep(ms: number): Promise<void> {
+      return new Promise((resolve) => window.setTimeout(resolve, ms))
+    }
+
+    function isActiveDownloadTask(comicId: number): boolean {
+      const state = store.progresses.get(comicId)?.state
+      return state === 'Pending' || state === 'Downloading'
+    }
+
+    async function collectSearchResultIds(): Promise<{ ids: number[]; skippedDownloaded: number; skippedActive: number }> {
+      const ids = new Set<number>()
+      let skippedDownloaded = 0
+      let skippedActive = 0
+
+      if (store.searchResult === undefined) {
+        return { ids: [], skippedDownloaded, skippedActive }
+      }
+
+      const totalPage = store.searchResult.totalPage
+      const mode = store.searchResult.isSearchByTag ? 'tag' : 'keyword'
+      const keyword = mode === 'tag' ? lastSearchTag.value.trim() : lastSearchKeyword.value.trim()
+
+      for (let page = 1; page <= totalPage; page += 1) {
+        let comics = store.searchResult.comics
+
+        if (page !== currentPage.value) {
+          const result =
+            mode === 'tag'
+              ? await commands.searchByTag(keyword, page)
+              : await commands.searchByKeyword(keyword, page)
+
+          if (result.status === 'error') {
+            console.error(result.error)
+            continue
+          }
+
+          comics = result.data.comics
+        }
+
+        for (const comic of comics) {
+          if (comic.isDownloaded) {
+            skippedDownloaded += 1
+            continue
+          }
+          if (isActiveDownloadTask(comic.id)) {
+            skippedActive += 1
+            continue
+          }
+          ids.add(comic.id)
+        }
+
+        await sleep(150)
+      }
+
+      return { ids: Array.from(ids), skippedDownloaded, skippedActive }
+    }
+
+    async function downloadAllSearchResults() {
+      if (downloadingAllSearchResults.value) {
+        message.warning('正在批量加入下载队列，请稍后再试')
+        return
+      }
+
+      if (searchingByKeyword.value || searchingByTag.value) {
+        message.warning('有搜索正在进行，请稍后再试')
+        return
+      }
+
+      if (store.searchResult === undefined || store.searchResult.totalPage <= 0) {
+        message.warning('没有可下载的搜索结果')
+        return
+      }
+
+      const mode = store.searchResult.isSearchByTag ? 'tag' : 'keyword'
+      const keyword = mode === 'tag' ? lastSearchTag.value.trim() : lastSearchKeyword.value.trim()
+      if (keyword.length === 0) {
+        message.warning('请先完成一次关键词或标签搜索')
+        return
+      }
+
+      downloadingAllSearchResults.value = true
+
+      let queuedCount = 0
+      let failedCount = 0
+      let skippedDownloaded = 0
+      let skippedActive = 0
+
+      try {
+        const collected = await collectSearchResultIds()
+        skippedDownloaded = collected.skippedDownloaded
+        skippedActive = collected.skippedActive
+
+        if (collected.ids.length === 0) {
+          message.warning('没有新的搜索结果需要下载')
+          return
+        }
+
+        for (const comicId of collected.ids) {
+          try {
+            const comicResult = await commands.getComic(comicId)
+            if (comicResult.status === 'error') {
+              console.error(comicResult.error)
+              failedCount += 1
+              continue
+            }
+
+            await commands.createDownloadTask(comicResult.data)
+            queuedCount += 1
+          } catch (err) {
+            console.error(err)
+            failedCount += 1
+          }
+
+          await sleep(150)
+        }
+
+        message.success(
+          `已加入队列：${queuedCount}，失败：${failedCount}，跳过已下载：${skippedDownloaded}，跳过下载中：${skippedActive}`,
+        )
+      } finally {
+        downloadingAllSearchResults.value = false
+      }
     }
 
     const render = () => (
@@ -185,6 +317,16 @@ export default defineComponent({
 
         {store.searchResult && (
           <>
+            <NButton
+              class="mx-2"
+              type="primary"
+              secondary
+              size="small"
+              loading={downloadingAllSearchResults.value}
+              disabled={store.searchResult.totalPage <= 0}
+              onClick={() => downloadAllSearchResults()}>
+              一键下载全部搜索结果（共 {store.searchResult.totalPage} 页）
+            </NButton>
             <div class="flex flex-col overflow-auto">
               <div ref={comicCardContainer} class="flex flex-col gap-row-2 overflow-auto p-2">
                 {store.searchResult.comics.map((comic) => (
